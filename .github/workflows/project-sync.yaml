@@ -13,6 +13,6 @@ jobs:
       destination_org: tf-acctest-org
       project_number: 2
       # Optional label filter (only add when item has any of these labels)
-      # filter_labels: "triage,needs-review"
-      # label_operator: "OR"
+      filter_labels: "triage,needs-review"
+      label_operator: "AND"
     secrets: inherit
