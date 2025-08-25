@@ -28,6 +28,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      issues: read
     env:
       DESTINATION_ORG: ${{ inputs.destination_org }}
       PROJECT_NUMBER:  ${{ inputs.project_number }}
@@ -58,16 +59,23 @@ jobs:
           echo "kind=$KIND" >> $GITHUB_OUTPUT
           echo "number=$NUM" >> $GITHUB_OUTPUT
 
-      - name: Fetch current labels (live)
+      - name: Fetch labels via GraphQL
         id: fetchlabels
         if: steps.pick.outputs.skip != 'true' && env.FILTER_LABELS != ''
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          set -e
-          NUM=${{ github.event.issue.number }}
-          REPO=${{ github.repository }}
-          gh api repos/$REPO/issues/$NUM/labels | jq -r '.[].name' > labels.txt
+          set -euo pipefail
+          CID='${{ steps.pick.outputs.content_id }}'
+          gh api graphql -f query='
+            query($id: ID!) {
+              node(id:$id) {
+                __typename
+                ... on Issue      { labels(first:100){ nodes { name } } }
+                ... on PullRequest{ labels(first:100){ nodes { name } } }
+              }
+            }' -f id="$CID" > labels.json
+          jq -r '.data.node.labels.nodes[].name' labels.json > labels.txt || true
           echo "labels=$(tr '\n' ',' < labels.txt | sed 's/,$//')" >> $GITHUB_OUTPUT
 
       - name: Evaluate label filter (AND/OR)
