@@ -30,11 +30,12 @@ jobs:
       contents: read
     env:
       DESTINATION_ORG: ${{ inputs.destination_org }}
-      PROJECT_NUMBER: ${{ inputs.project_number }}
-      FILTER_LABELS: ${{ inputs.filter_labels }}
-      LABEL_OPERATOR: ${{ inputs.label_operator || 'OR' }}
+      PROJECT_NUMBER:  ${{ inputs.project_number }}
+      FILTER_LABELS:   ${{ inputs.filter_labels }}
+      LABEL_OPERATOR:  ${{ inputs.label_operator || 'OR' }}
     steps:
-      - name: Decide contentId from event
+      # Decide which node we're adding (issue or PR)
+      - name: Pick contentId from event
         id: pick
         run: |
           set -e
@@ -42,70 +43,133 @@ jobs:
           EVENT="${{ github.event_name }}"
           if [ "$EVENT" = "issues" ] && [ -n "${{ github.event.issue.node_id }}" ]; then
             CONTENT_ID="${{ github.event.issue.node_id }}"
+            KIND="issue"
+            NUM="${{ github.event.issue.number }}"
           elif [ "$EVENT" = "pull_request" ] && [ -n "${{ github.event.pull_request.node_id }}" ]; then
             CONTENT_ID="${{ github.event.pull_request.node_id }}"
+            KIND="pr"
+            NUM="${{ github.event.pull_request.number }}"
           fi
           if [ -z "$CONTENT_ID" ]; then
-            echo "No issue/PR node_id in this event; exiting 0."
             echo "skip=true" >> $GITHUB_OUTPUT
             exit 0
           fi
           echo "content_id=$CONTENT_ID" >> $GITHUB_OUTPUT
+          echo "kind=$KIND" >> $GITHUB_OUTPUT
+          echo "number=$NUM" >> $GITHUB_OUTPUT
 
-      - name: (Optional) label filter
-        id: labelfilter
-        if: steps.pick.outputs.skip != 'true' && env.FILTER_LABELS != ''
-        run: |
-          set -e
-          WANT=$(echo "$FILTER_LABELS" | tr ',' '\n' | sed 's/^ *//;s/ *$//' | tr '\n' '|')
-          WANT_RE="^($(echo "$WANT" | sed 's/|$//'))$"
-          # Build set of labels on the item from event payload (works for both issues & PRs)
-          labels=$(jq -r '
-            .issue.labels // .pull_request.labels // [] | map(.name) | .[]
-          ' <<< '${{ toJson(github.event) }}' || true)
-          match_count=0
-          for l in $labels; do
-            if [[ "$l" =~ $WANT_RE ]]; then match_count=$((match_count+1)); fi
-          done
-          OP="${LABEL_OPERATOR}"
-          ok="false"
-          if [ "$OP" = "AND" ]; then
-            need=$(echo "$FILTER_LABELS" | tr ',' '\n' | sed '/^$/d' | wc -l | tr -d ' ')
-            [ "$match_count" -ge "$need" ] && ok="true"
-          else
-            [ "$match_count" -ge 1 ] && ok="true"
-          fi
-          echo "labels_ok=$ok" >> $GITHUB_OUTPUT
-          if [ "$ok" != "true" ]; then
-            echo "Label filter not satisfied; skipping."
-          fi
-
-      - name: Mint App token (Org A installation)
-        id: appA
-        if: steps.pick.outputs.skip != 'true' && (steps.labelfilter.outcome == 'skipped' || steps.labelfilter.outputs.labels_ok == 'true')
+      # Mint Org B token to read the live label set
+      - name: Mint App token (Org B install) for reads
+        id: appB
+        if: steps.pick.outputs.skip != 'true'
         uses: actions/create-github-app-token@v2
         with:
           app-id: ${{ secrets.APP_ID }}
           private-key: ${{ secrets.APP_PEM }}
+          owner: ${{ github.repository_owner }}
+
+      # Re-fetch labels live (so AND/OR works even when labels were added after creation)
+      - name: Fetch current labels (live)
+        id: fetchlabels
+        if: steps.pick.outputs.skip != 'true' && env.FILTER_LABELS != ''
+        env:
+          GH_TOKEN: ${{ steps.appB.outputs.token }}
+        run: |
+          set -e
+          REPO="${{ github.repository }}"
+          if [ "${{ steps.pick.outputs.kind }}" = "issue" ]; then
+            gh api repos/$REPO/issues/${{ steps.pick.outputs.number }}/labels | jq -r '.[].name' > labels.txt
+          else
+            gh api repos/$REPO/pulls/${{ steps.pick.outputs.number }}/labels  | jq -r '.[].name' > labels.txt
+          fi
+          echo "labels=$(tr '\n' ',' < labels.txt | sed 's/,$//')" >> $GITHUB_OUTPUT
+
+      - name: Evaluate label filter (AND/OR)
+        id: labelfilter
+        if: steps.pick.outputs.skip != 'true' && env.FILTER_LABELS != ''
+        run: |
+          set -e
+          HAVE="${{ steps.fetchlabels.outputs.labels }}"
+          WANT="$FILTER_LABELS"
+          OP="${LABEL_OPERATOR:-OR}"
+          ok="false"
+          if [ -z "$WANT" ]; then
+            ok="true"
+          elif [ "$OP" = "AND" ]; then
+            ok="true"
+            IFS=','; for w in $WANT; do
+              echo "$HAVE" | tr ',' '\n' | grep -qx "$w" || ok="false"
+            done
+          else
+            IFS=','; for w in $WANT; do
+              echo "$HAVE" | tr ',' '\n' | grep -qx "$w" && ok="true"
+            done
+          fi
+          echo "labels_ok=$ok" >> $GITHUB_OUTPUT
+          if [ "$ok" != "true" ]; then
+            echo "Label filter not satisfied; exiting 0."
+            exit 0
+          fi
+
+      # Mint Org A token to write to the project
+      - name: Mint App token for project writes
+        id: app
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.APP_ID }} 
+          private-key: ${{ secrets.APP_PEM }}
           owner: ${{ env.DESTINATION_ORG }}
 
-      - name: Resolve Org A Project ID
-        if: steps.appA.outcome == 'success'
+      # Resolve projectId once per run (or hardcode PROJECT_ID to skip this)
+      - name: Resolve Org Project ID
+        id: proj
         env:
-          GH_TOKEN: ${{ steps.appA.outputs.token }}
+          GH_TOKEN: ${{ steps.app.outputs.token }}
         run: |
+          set -e
           gh api graphql -f query='
             query($org:String!, $num:Int!) {
               organization(login:$org) { projectV2(number:$num){ id } }
             }' -f org="$DESTINATION_ORG" -F num="$PROJECT_NUMBER" > project.json
           echo "PROJECT_ID=$(jq -r .data.organization.projectV2.id project.json)" >> "$GITHUB_ENV"
 
-      - name: Add item to Org A Project
-        if: steps.appA.outcome == 'success'
+      # Optional: fast idempotency — skip if content already in this project
+      - name: Skip if already in project
+        id: already
         env:
-          GH_TOKEN: ${{ steps.appA.outputs.token }}
+          GH_TOKEN: ${{ steps.app.outputs.token }}
         run: |
+          set -e
+          CID='${{ steps.pick.outputs.content_id }}'
+          PID="$PROJECT_ID"
+          # Ask the node what projects v2 it belongs to
+          gh api graphql -f query='
+            query($id:ID!) {
+              node(id:$id) {
+                __typename
+                ... on Issue {
+                  projectsV2(first:20) { nodes { project { id number title } } }
+                }
+                ... on PullRequest {
+                  projectsV2(first:20) { nodes { project { id number title } } }
+                }
+              }
+            }' -f id="$CID" > membership.json
+          IN=$(jq -r --arg PID "$PID" '
+            .data.node.projectsV2.nodes[].project.id == $PID
+          ' membership.json | grep -c true || true)
+          if [ "$IN" -gt 0 ]; then
+            echo "skip_add=true" >> $GITHUB_OUTPUT
+          fi
+
+      # Add the item to the project (shows real errors if any)
+      - name: Add item to Project
+        if: steps.already.outputs.skip_add != 'true'
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        run: |
+          set -e
           gh api graphql -f query='
             mutation($p:ID!, $c:ID!) {
               addProjectV2ItemById(input:{projectId:$p, contentId:$c}) { item { id } }
-            }' -f p="$PROJECT_ID" -f c="${{ steps.pick.outputs.content_id }}" || true
+            }' -f p="$PROJECT_ID" -f c="${{ steps.pick.outputs.content_id }}"
