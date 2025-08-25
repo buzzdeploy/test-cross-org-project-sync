@@ -6,8 +6,14 @@ on:
     types: [opened, reopened, labeled, edited]
   workflow_dispatch: {}
 
+permissions:
+  contents: read
+
 jobs:
   add:
+    permissions:
+      contents: read
+      issues: read
     uses: ./.github/workflows/callable-project-sync.yaml
     with:
       destination_org: tf-acctest-org
