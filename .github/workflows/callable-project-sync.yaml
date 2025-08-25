@@ -58,30 +58,16 @@ jobs:
           echo "kind=$KIND" >> $GITHUB_OUTPUT
           echo "number=$NUM" >> $GITHUB_OUTPUT
 
-      # Mint Org B token to read the live label set
-      - name: Mint App token (Org B install) for reads
-        id: appB
-        if: steps.pick.outputs.skip != 'true'
-        uses: actions/create-github-app-token@v2
-        with:
-          app-id: ${{ secrets.APP_ID }}
-          private-key: ${{ secrets.APP_PEM }}
-          owner: ${{ github.repository_owner }}
-
-      # Re-fetch labels live (so AND/OR works even when labels were added after creation)
       - name: Fetch current labels (live)
         id: fetchlabels
         if: steps.pick.outputs.skip != 'true' && env.FILTER_LABELS != ''
         env:
-          GH_TOKEN: ${{ steps.appB.outputs.token }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -e
-          REPO="${{ github.repository }}"
-          if [ "${{ steps.pick.outputs.kind }}" = "issue" ]; then
-            gh api repos/$REPO/issues/${{ steps.pick.outputs.number }}/labels | jq -r '.[].name' > labels.txt
-          else
-            gh api repos/$REPO/pulls/${{ steps.pick.outputs.number }}/labels  | jq -r '.[].name' > labels.txt
-          fi
+          NUM=${{ github.event.issue.number }}
+          REPO=${{ github.repository }}
+          gh api repos/$REPO/issues/$NUM/labels | jq -r '.[].name' > labels.txt
           echo "labels=$(tr '\n' ',' < labels.txt | sed 's/,$//')" >> $GITHUB_OUTPUT
 
       - name: Evaluate label filter (AND/OR)
